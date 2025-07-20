@@ -1,11 +1,16 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::fs::File;
+use std::io::{BufReader};
+use std::io::ErrorKind::NotFound;
 use std::net::SocketAddr;
+use std::ops::Deref;
 use hyper::body::{Bytes, Incoming};
 use std::path::Path;
 use std::process::exit;
 use std::str::FromStr;
+use std::sync::Arc;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode, Uri};
@@ -16,8 +21,20 @@ use hyper_util::client::legacy::connect::{HttpConnector};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use lazy_static::lazy_static;
 use tokio::net::{TcpListener};
-use log::{debug, error, info, LevelFilter};
+use log::{error, info, LevelFilter};
+use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer};
+use rustls_pemfile::{certs, private_key};
 use simplelog::{ColorChoice, CombinedLogger, TermLogger, TerminalMode};
+use tokio_rustls::TlsAcceptor;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct SslConfig {
+    #[serde(rename = "cert")]
+    cert_path: String,
+    #[serde(rename = "privateKey")]
+    key_path: String,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct Config {
@@ -27,6 +44,7 @@ struct Config {
     servers: HashMap<String, String>,
     #[serde(rename = "extraHeaders")]
     extra_headers: HashMap<String, String>,
+    ssl: Option<SslConfig>
 }
 
 impl Default for Config {
@@ -37,7 +55,8 @@ impl Default for Config {
             bind: "127.0.0.1:3000".into(),
             own_api_key: "EMPTY".into(),
             servers: map,
-            extra_headers: HashMap::new()
+            extra_headers: HashMap::new(),
+            ssl: None
         }
     }
 }
@@ -110,16 +129,16 @@ async fn handle(req: Request<Incoming>) -> Result<Response<BoxBody<Bytes, hyper:
     Ok(resp.map(|b| b.boxed())) // stream response
 }
 
-async fn wrap(req: Request<Incoming>) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+async fn wrap(req: Request<Incoming>, sock: Arc<SocketAddr>) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let method = req.method().as_str().to_string();
     let uri = req.uri().path().to_string();
     let res = handle(req).await;
     match &res {
         Ok(r) => {
-            info!("{} {} -> {}", method, uri, r.status().to_string());
+            info!("{} {} {} -> {}", sock, method, uri, r.status().to_string());
         },
         Err(e) => {
-            error!("{} {} -> {}",  method, uri, e.to_string())
+            error!("{} {} {} -> {}", sock, method, uri, e.to_string())
         }
     }
 
@@ -159,22 +178,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = SocketAddr::from_str(CONFIG.bind.as_str()).expect(format!("Invalid bind: {}", CONFIG.bind).as_str());
 
     let listener = TcpListener::bind(addr).await?;
-    info!("Listening at {}", addr.to_string());
-
-    loop {
-        let (stream, _) = listener.accept().await?;
-
-        let io = TokioIo::new(stream);
-
-        tokio::task::spawn(async move {
-            if let Err(err) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service_fn(wrap))
-                .await
-            {
-                error!("Error serving connection: {:?}", err);
+    match &CONFIG.ssl {
+        Some(ssl) => {
+            info!("Loading SSL config");
+            let tls_config = load_tls_config(ssl).expect("Failed to load TLS");
+            let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
+            info!("Listening at https://{}", &addr);
+            loop {
+                let (stream, sock) = listener.accept().await?;
+                let tls_acceptor = tls_acceptor.clone();
+                let socket_addr = Arc::new(sock);
+                tokio::task::spawn(async move {
+                    match tls_acceptor.accept(stream).await {
+                        Ok(tls_stream) => {
+                            let io = TokioIo::new(tls_stream);
+                            if let Err(err) = hyper::server::conn::http1::Builder::new()
+                                .serve_connection(io, service_fn(|req| wrap(req, socket_addr.clone())))
+                                .await
+                            {
+                                error!("Error serving HTTPS connection: {:?} for {}", err, socket_addr);
+                            }
+                        }
+                        Err(e) => {
+                            error!("TLS handshake failed: {:?} from {}", e, socket_addr);
+                        }
+                    }
+                });
             }
-        });
-    }
+        },
+        None => {
+            info!("Listening at http://{}", &addr);
+
+            loop {
+                let (stream, sock) = listener.accept().await?;
+                let socket_addr = Arc::new(sock);
+                let io = TokioIo::new(stream);
+                tokio::task::spawn(async move {
+                    if let Err(err) = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service_fn(|req| wrap(req, socket_addr.clone())))
+                        .await
+                    {
+                        error!("Error serving connection: {:?} for {}", err, socket_addr);
+                    }
+                });
+            }
+        }
+    };
+
 }
 
 fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
@@ -199,5 +249,26 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
         new_map.insert(header.0.to_lowercase(), header.1);
     }
     config.extra_headers = new_map;
+    Ok(config)
+}
+
+fn load_tls_config(ssl_config: &SslConfig) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+    let cert_file = &mut BufReader::new(File::open(&ssl_config.cert_path)?);
+    let key_file = &mut BufReader::new(File::open(&ssl_config.key_path)?);
+
+    let certs: Vec<CertificateDer<'static>> = certs(cert_file)
+        .into_iter()
+        .map(|res| CertificateDer::from(res.expect(&format!("Failed to read certificate {}", &ssl_config.cert_path))))
+        .collect();
+
+    let key = match private_key(key_file)? {
+        Some(k) => k,
+        None => return Err(Box::from(std::io::Error::new(NotFound, "Key not found")))
+    };
+
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+
     Ok(config)
 }
