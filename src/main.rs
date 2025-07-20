@@ -5,7 +5,6 @@ use std::fs::File;
 use std::io::{BufReader};
 use std::io::ErrorKind::NotFound;
 use std::net::SocketAddr;
-use std::ops::Deref;
 use hyper::body::{Bytes, Incoming};
 use std::path::Path;
 use std::process::exit;
@@ -83,12 +82,19 @@ async fn handle(req: Request<Incoming>) -> Result<Response<BoxBody<Bytes, hyper:
     };
 
     let path = req.uri().path();
-    let query = req.uri().query().map(|q| format!("?{}", q)).unwrap_or_default();
+    let query = req.uri().query().unwrap_or("");
+    let mut query_len = query.len();
+    if query_len != 0 {
+        query_len += 1;
+    }
     // much faster way to concat a string
-    let mut request_path = String::with_capacity(path.len() + url.len() + query.len());
+    let mut request_path = String::with_capacity(path.len() + url.len() + query_len);
     request_path.push_str(url);
     request_path.push_str(path);
-    request_path.push_str(&query);
+    if query_len != 0 {
+        request_path.push('?');
+        request_path.push_str(&query);
+    }
 
     let target_uri = match Uri::from_str(&request_path) {
         Ok(u) => u,
@@ -176,7 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ).unwrap();
 
     let addr = SocketAddr::from_str(CONFIG.bind.as_str()).expect(format!("Invalid bind: {}", CONFIG.bind).as_str());
-
+    HTTP_CLIENT.__private_field;
     let listener = TcpListener::bind(addr).await?;
     match &CONFIG.ssl {
         Some(ssl) => {
